@@ -1,0 +1,124 @@
+name: Build installer
+
+# One artifact: the NSIS installer for Windows. Nothing else is packaged, and
+# no other platform is built.
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+# A superseded run is worth cancelling: every run downloads a 232 MB upstream
+# release and packages a 250 MB payload.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The published release whose payload is bundled into the installer.
+  #
+  # A cloud runner cannot build the payload itself. `npm run payload` collects
+  # NVIDIA's DLSS DLLs, the RenoDX add-ons and a ReShade setup from wherever
+  # they happen to sit on a developer's disk - none of which is in this
+  # repository, and none of which has a public download. The published
+  # installer is the one place those exact, verified files are available, so
+  # the payload is taken from it. Bump both lines together when the app moves
+  # to a newer upstream release, and check that verify-cloud-payload.js passes:
+  # it fails the build rather than shipping an installer whose sliders would
+  # quietly do nothing.
+  UPSTREAM_TAG: v2.2.7
+  UPSTREAM_ASSET: DLSS5-Swapper-Setup-2.2.7.exe
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # build/icon.ico is generated rather than committed, the same way a
+      # release build makes it. The packager and the installer both icon off it.
+      - name: Build the app icon
+        run: npm run icon
+
+      # zig and the pinned ReShade/ImGui headers, from their official URLs.
+      - name: Fetch the overlay toolchain
+        run: npm run overlay:prepare
+
+      - name: Build the in-game overlay add-on
+        run: npm run overlay:build
+
+      # Extracts resources/payload from the published installer. The installer
+      # is a 7-Zip archive, so this needs no installation and no elevation.
+      - name: Fetch the payload from the upstream release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://github.com/rakanki911/DLSS5-Swapper/releases/download/$env:UPSTREAM_TAG/$env:UPSTREAM_ASSET"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile upstream-installer.exe
+
+          # Preinstalled on the runner; the standalone 7zr is the fallback if a
+          # future image drops it.
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+          if (!(Test-Path -LiteralPath $sevenZip)) {
+            Invoke-WebRequest -Uri 'https://www.7-zip.org/a/7zr.exe' -OutFile 7zr.exe
+            $sevenZip = Join-Path $PWD '7zr.exe'
+          }
+
+          # Into the working directory, not into -oresources: 7-Zip keeps the
+          # path it was given inside the output folder, so naming the folder
+          # after the path lands the files in resources\resources\payload.
+          & $sevenZip x upstream-installer.exe '-o.' 'resources\payload' -y
+          if ($LASTEXITCODE -ne 0) { throw 'Could not extract the payload from the upstream installer.' }
+          Move-Item -LiteralPath 'resources\payload' -Destination 'payload'
+          Remove-Item -LiteralPath 'resources' -Recurse -Force
+          Remove-Item -LiteralPath 'upstream-installer.exe'
+
+      # The overlay add-on and the optional add-on folder are extra resources,
+      # so both have to exist at packaging time even when they are empty.
+      - name: Stage the overlay beside the payload
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path overlay-bin, addons | Out-Null
+          Copy-Item -LiteralPath 'dist\overlay\dlss5-lab-overlay.addon64' -Destination 'overlay-bin\'
+          Get-ChildItem payload, overlay-bin | Select-Object -First 4 Name
+
+      # Refuses the build if the payload is incomplete, if the Feeder in it is
+      # not the one the overlay is pinned to, or if the overlay is missing.
+      - name: Verify the payload
+        run: node scripts/verify-cloud-payload.js
+
+      # build:ci, not build: `npm run build` would run the payload step first,
+      # and that step is exactly what cannot run here.
+      - name: Build the installer
+        run: npm run build:ci
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLSS5-Swapper-Setup
+          path: dist/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  # Informational, and deliberately not a dependency of the build: a red test
+  # is worth reading, but it should not stand between you and an installer.
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci
+      - run: npm test
