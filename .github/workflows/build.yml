@@ -73,10 +73,19 @@ jobs:
             $sevenZip = Join-Path $PWD '7zr.exe'
           }
 
+          # -t7z is load-bearing. An electron-builder NSIS installer is a 7-Zip
+          # archive with an NSIS stub in front of it, and a full 7-Zip opens it
+          # with the NSIS handler instead: that handler sees the installer's own
+          # files and reports success having matched nothing ("Files: 0"), so
+          # the payload silently is not there. The 7z handler reads the archive
+          # itself, which is where resources/payload actually lives. 7zr and the
+          # reduced 7za have no NSIS handler and pick the right one on their
+          # own, which is why this only fails on the runner.
+          #
           # Into the working directory, not into -oresources: 7-Zip keeps the
           # path it was given inside the output folder, so naming the folder
           # after the path lands the files in resources\resources\payload.
-          & $sevenZip x upstream-installer.exe '-o.' 'resources\payload' -y
+          & $sevenZip x -t7z upstream-installer.exe '-o.' 'resources\payload' -y
           if ($LASTEXITCODE -ne 0) { throw 'Could not extract the payload from the upstream installer.' }
           Move-Item -LiteralPath 'resources\payload' -Destination 'payload'
           Remove-Item -LiteralPath 'resources' -Recurse -Force
@@ -121,4 +130,12 @@ jobs:
           node-version: '20'
           cache: npm
       - run: npm ci
-      - run: npm test
+      # Not `npm test`: on Windows npm runs a script through cmd.exe, which
+      # does not expand test/*.test.js, and the runner's Node 20 accepts globs
+      # no more than cmd does - it looks for a file literally called *.test.js
+      # and the job dies with "Could not find". bash expands the same pattern
+      # the way npm does on Linux and macOS, which is what this suite was
+      # written against. The command matches the test script in package.json.
+      - name: Run the test suite
+        shell: bash
+        run: node --test --test-concurrency=1 test/*.test.js
