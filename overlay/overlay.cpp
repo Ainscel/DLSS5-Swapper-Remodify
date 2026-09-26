@@ -43,7 +43,15 @@ static_assert(IMGUI_VERSION_NUM == 19250, "Revalidate the ReShade/ImGui ABI befo
 
 namespace {
 constexpr uint32_t frame_magic = 0x31464c44, input_magic = 0x31494c44;
-constexpr uint32_t panel_width = 534, max_height = 1600, max_frame = panel_width * max_height * 4 + 24;
+// 534 is the panel's layout, and it is also the unit the app's own coordinates
+// are in. The frame that arrives is that layout rendered at whatever size was
+// chosen, so it carries its own width and is drawn one frame pixel to one panel
+// pixel - a 4K screen gets a panel that is large and sharp instead of one small
+// bitmap stretched to fit. The bounds keep every buffer bounded whatever a
+// frame claims. They mirror MIN_WIDTH/MAX_WIDTH/MAX_HEIGHT in
+// src/overlay-protocol.js, which is the other end of this contract.
+constexpr uint32_t panel_width = 534, min_frame_width = 400, max_frame_width = 1335;
+constexpr uint32_t max_height = 4000, max_frame = max_frame_width * max_height * 4 + 24;
 struct input_packet { uint32_t magic = input_magic, action; int32_t x, y, value; };
 static_assert(sizeof(input_packet) == 20);
 
@@ -104,9 +112,9 @@ class connection {
                 commands.push_back({h[2], h[3], h[4], value});
                 incoming.erase(incoming.begin(), incoming.begin() + 24); continue;
             }
-            if (h[0] != frame_magic || h[1] != 1 || h[3] != panel_width || !h[4] || h[4] > max_height || h[5] != h[3] * h[4] * 4) { disconnect(); return false; }
+            if (h[0] != frame_magic || h[1] != 1 || h[3] < min_frame_width || h[3] > max_frame_width || !h[4] || h[4] > max_height || h[5] != h[3] * h[4] * 4) { disconnect(); return false; }
             if (incoming.size() < h[5] + 24) break;
-            pixels.assign(incoming.begin() + 24, incoming.begin() + h[5] + 24); height = h[4]; sequence = h[2];
+            pixels.assign(incoming.begin() + 24, incoming.begin() + h[5] + 24); width = h[3]; height = h[4]; sequence = h[2];
             incoming.erase(incoming.begin(), incoming.begin() + h[5] + 24);
             send(0, 0, 0, static_cast<int32_t>(sequence));
         }
@@ -115,7 +123,9 @@ class connection {
 public:
     std::vector<unsigned char> pixels;
     std::vector<lab_live::command> commands;
-    uint32_t height = 0, sequence = 0;
+    // width comes with each frame rather than from a constant: the app renders
+    // the panel at the size that was chosen in it.
+    uint32_t width = 0, height = 0, sequence = 0;
     bool live_peer = false, nr_peer = false, feed_peer = false;
     connection() { read_op.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr); write_op.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr); }
     ~connection() { disconnect(); CloseHandle(read_op.hEvent); CloseHandle(write_op.hEvent); }
@@ -128,7 +138,7 @@ public:
             if (writing) GetOverlappedResult(pipe, &write_op, &ignored, TRUE);
             CloseHandle(pipe); pipe = INVALID_HANDLE_VALUE;
         }
-        reading = writing = live_peer = nr_peer = feed_peer = false; incoming.clear(); outgoing.clear(); commands.clear(); pixels.clear(); sequence = height = 0;
+        reading = writing = live_peer = nr_peer = feed_peer = false; incoming.clear(); outgoing.clear(); commands.clear(); pixels.clear(); sequence = width = height = 0;
     }
     void send(uint32_t action, int32_t x, int32_t y, int32_t value = 0) {
         if (!connected()) return;
@@ -326,8 +336,8 @@ void draw(reshade::api::effect_runtime *runtime) {
     if (s.uploaded != bridge.sequence) {
         release_texture(runtime, s);
         using namespace reshade::api;
-        const resource_desc desc(panel_width, bridge.height, 1, 1, format::r8g8b8a8_unorm, 1, memory_heap::default_, resource_usage::shader_resource);
-        subresource_data data = { bridge.pixels.data(), panel_width * 4, panel_width * bridge.height * 4 };
+        const resource_desc desc(bridge.width, bridge.height, 1, 1, format::r8g8b8a8_unorm, 1, memory_heap::default_, resource_usage::shader_resource);
+        subresource_data data = { bridge.pixels.data(), bridge.width * 4, bridge.width * bridge.height * 4 };
         auto device = runtime->get_device();
         if (!device->create_resource(desc, &data, resource_usage::shader_resource, &s.texture) ||
             !device->create_resource_view(s.texture, resource_usage::shader_resource, resource_view_desc(format::r8g8b8a8_unorm), &s.view)) {
@@ -337,7 +347,11 @@ void draw(reshade::api::effect_runtime *runtime) {
     }
     const auto origin = vector_call(imgui_function_table_instance()->GetCursorScreenPos);
     if (panel_scale <= 0.f) panel_scale = load_scale(runtime);
-    const float width = panel_width * panel_scale, drawn = bridge.height * panel_scale;
+    // How many frame pixels the app used for one of its own 534 points. The
+    // title bar and the grip are hit in frame pixels, so the parts of the
+    // layout they name have to be brought up by the same factor.
+    const float ui = float(bridge.width) / float(panel_width);
+    const float width = bridge.width * panel_scale, drawn = bridge.height * panel_scale;
     // The panel's own pixels are still 1:1 with what the app drew; only the
     // rectangle they are stretched into changes, so fonts and sliders never
     // inherit ReShade's font or scaling.
@@ -370,7 +384,7 @@ void draw(reshade::api::effect_runtime *runtime) {
     // Never let it grow past the screen: the grip lives in the panel's bottom
     // right corner, and a panel taller than the display would take the grip off
     // with it, leaving no way to make it small again.
-    const float fits = std::min(io.DisplaySize.x / panel_width, io.DisplaySize.y / float(bridge.height));
+    const float fits = std::min(io.DisplaySize.x / float(bridge.width), io.DisplaySize.y / float(bridge.height));
     const float ceiling = std::max(min_scale, std::min(fits, max_scale));
     if (panel_scale > ceiling) panel_scale = ceiling;
     if (s.sizing) {
@@ -380,7 +394,7 @@ void draw(reshade::api::effect_runtime *runtime) {
         else {
             // Follow the corner the pointer is actually dragging, along the
             // diagonal, so the panel keeps its shape.
-            const float wanted = (io.MousePos.x + s.grab - origin.x) / panel_width;
+            const float wanted = (io.MousePos.x + s.grab - origin.x) / bridge.width;
             panel_scale = std::clamp(wanted, min_scale, ceiling);
         }
     } else if (over_grip && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -388,7 +402,7 @@ void draw(reshade::api::effect_runtime *runtime) {
         s.grab = corner.x - io.MousePos.x;
     }
     if (s.sizing || on_grip) return;
-    if (hovered && y < 52 && x < 320 && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) s.moving = true;
+    if (hovered && y < 52 * ui && x < 320 * ui && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) s.moving = true;
     if (s.moving) {
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) s.moving = false;
         else { panel_position.x += io.MouseDelta.x; panel_position.y += io.MouseDelta.y; }
@@ -478,7 +492,9 @@ void compact_draw(reshade::api::effect_runtime *runtime) {
     runtime->block_input_next_frame();
     if (panel_scale <= 0.f) panel_scale = load_scale(runtime);
     const float height = std::min(float(s.bridge.height ? s.bridge.height : 806) * panel_scale, std::max(120.f, io.DisplaySize.y));
-    const float window_width = panel_width * panel_scale;
+    // Before the first frame there is no width to use; the fallback is the
+    // panel's own 534, which is what it was when this was a constant.
+    const float window_width = float(s.bridge.width ? s.bridge.width : panel_width) * panel_scale;
     panel_position.x = std::clamp(panel_position.x, 0.f, std::max(0.f, io.DisplaySize.x - window_width));
     panel_position.y = std::clamp(panel_position.y, 0.f, std::max(0.f, io.DisplaySize.y - height));
     ImGui::SetNextWindowDockID(0, ImGuiCond_Always);

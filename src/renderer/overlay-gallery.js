@@ -20,6 +20,11 @@ async function render(){
  if(!r.ok||!s.ok){$('olStatus').textContent=r.error||s.error;return;}prefs=s.value;
  $('olSubtitle').textContent=text('Choose your style. Preview it, then make it yours.','اختر ثيمك، جرّبه في المعاينة، ثم حدده.');
  $('olEnabled').checked=prefs.enabled;$('olEnabledLabel').textContent=text('Install overlay with DLSS','تثبيت الأوفرلاي مع DLSS');$('olHotkey').textContent=`Hotkey · ${keyLabel(prefs.hotkey)}`;
+ // The panel is rendered at this size instead of being stretched to it, so a
+ // 4K screen gets a large panel whose text is still sharp.
+ $('olUiScaleLabel').textContent=text('Panel size','حجم اللوحة');
+ $('olUiScale').value=prefs.uiScale;
+ $('olUiScaleValue').textContent=`${prefs.uiScale}×`;
  $('olAdd').textContent=text('＋ Add Overlay','＋ إضافة أوفرلاي');$('olSource').textContent=text('Developer files','ملفات المطورين');dispose();
  $('olThemeGallery').innerHTML=themeList().map(([id,en,ar])=>`<article class="ol-theme-card ${prefs.theme===id?'selected':''}" data-overlay-theme="${id}"><div class="ol-card-stage"><div class="ol-static-panel" inert aria-hidden="true"></div></div><div class="ol-theme-bottom"><h3>${text(en,ar)}</h3><div class="ol-actions"><button class="ol-select" data-ol-action="select" data-id="${id}" aria-pressed="${prefs.theme===id}">${prefs.theme===id?text('✓ Selected','✓ محدد'):text('Select','اختيار')}</button>${button('preview',id,text('◉ Preview','◉ معاينة'))}${id==='custom'?`<button class="drop" data-ol-action="delete-theme" data-id="custom" title="${text('Delete this theme','حذف هذا الثيم')}" aria-label="${text('Delete this theme','حذف هذا الثيم')}"><svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>`:''}</div></div></article>`).join('');
  for(const root of document.querySelectorAll('.ol-static-panel')){window.mountOverlayLive(root,{designOnly:true});root.querySelectorAll('.ol-live-modes,.ol-preview-backend').forEach(e=>e.remove());root.querySelectorAll('[id]').forEach(e=>e.removeAttribute('id'));root.querySelectorAll('[for]').forEach(e=>e.removeAttribute('for'));}
@@ -65,6 +70,11 @@ async function showBridge(){
 }
 async function action(name,id){if(busy)return;if(name==='preview'){preview(id);return;}if(name==='select'){await save({theme:id});return;}if(name==='delete-theme'){await save({custom:null,theme:prefs.theme==='custom'?'green':prefs.theme});return;}busy=true;try{const r=await({add:window.lab.overlayAdd,remove:window.lab.overlayRemove,install:window.lab.overlayInstall,uninstall:window.lab.overlayUninstall,source:window.lab.overlaySource})[name](id);$('olStatus').textContent=r.ok?text('Done.','تم.'):r.error;}catch(e){$('olStatus').textContent=e.message;}finally{busy=false;await render();}}
 $('olAdd').onclick=()=>action('add');$('olSource').onclick=()=>action('source');$('olEnabled').onchange=()=>save({enabled:$('olEnabled').checked});
+// Saved on release rather than on every step of the drag: each save reaches the
+// panel in the game, and re-rendering it per pixel of slider travel is work
+// nobody asked for. The number follows the drag either way.
+$('olUiScale').oninput=()=>{$('olUiScaleValue').textContent=`${Number($('olUiScale').value)}×`;};
+$('olUiScale').onchange=()=>save({uiScale:Number($('olUiScale').value)});
 $('olPreviewClose').onclick=()=>$('olPreviewDialog').close();$('olPreviewDialog').addEventListener('close',()=>{$('olPreview')._overlayDispose?.();$('olPreview').replaceChildren();});
 // Create-a-theme dialog. The preview repaints on every colour change so the
 // choice is judged on the real panel, not on a swatch.

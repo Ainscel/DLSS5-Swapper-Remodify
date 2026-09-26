@@ -61,6 +61,12 @@
 .ol-install-switch input:checked { background:#7bb509 }
 .ol-install-switch input:checked::after { transform:translateX(18px) }
 .ol-install-switch input:focus-visible { outline:2px solid #8bc400; outline-offset:3px }
+/* The panel is rendered at this size rather than stretched to it, so the number
+   is the honest one: 2x is twice the pixels and twice the room for text. */
+.ol-sizer { align-items:center; gap:12px; font-size:12px; margin:10px 0 2px }
+.ol-sizer label { flex:none }
+.ol-sizer input[type=range] { flex:1; min-width:140px; max-width:320px; accent-color:#7bb509 }
+.ol-sizer output { flex:none; min-width:42px; text-align:right; opacity:.65; font-variant-numeric:tabular-nums }
 .ol-dialog { position:fixed; inset:0; margin:auto; width:min(590px,calc(100vw - 40px)); max-width:calc(100vw - 40px); height:fit-content; max-height:90vh; box-sizing:border-box; padding:18px; border:1px solid var(--stroke); border-radius:18px; background:var(--panel); color:var(--text); overflow:auto; box-shadow:0 30px 100px #0006 }
 .ol-theme-bottom button[data-ol-action="preview"]:is(:hover,:focus-visible,:active) { color:#fff; background:#25313d; border-color:var(--ol-accent); }
 .ol-dialog::backdrop { background:rgba(8,13,18,.72); backdrop-filter:blur(5px) }

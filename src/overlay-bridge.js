@@ -16,16 +16,37 @@ module.exports = async function startOverlayBridge({ BrowserWindow, userData, id
   const profile = path.basename(userData);
   const pipeName = `\\\\.\\pipe\\${profile}-overlay-${token}`;
   let latest = null, sequence = 0, client = null, closed = false, ready = false;
-  // What the panel is in CSS pixels, which is what the add-on expects to be
-  // handed regardless of what the desktop's scaling makes of it.
+  // What the panel is in CSS pixels, which is the layout's own size and never
+  // changes with the UI scale - only how many device pixels it is rendered at
+  // does. `panelHeight` is the CSS height the renderer measures; the frame the
+  // add-on is handed is that height times the scale.
   let panelHeight = 900;
+  let uiScale = 1;
+  const frameWidth = () => protocol.widthFor(uiScale);
+  const frameHeight = () => Math.round(panelHeight * uiScale);
   // How long an unreachable game may hold the single connection.
   const IDLE_TAKEOVER_MS = idleTakeoverMs;
   let server = null;
   let runtimeStatus = null, commandTime = 0, commandCount = 0;
   const win = new BrowserWindow({ show: false, width: protocol.WIDTH, height: 900, transparent: true, frame: false,
     webPreferences: { preload: path.join(__dirname, '../overlay-preload.js'), offscreen: true, contextIsolation: true, sandbox: true, nodeIntegration: false, backgroundThrottling: false, spellcheck: false } });
-  const preferenceChanged=(dir,value)=>{if(dir===userData&&!closed&&!win.isDestroyed())win.webContents.send('lab-overlay-preferences',value);};
+  // The viewport stays the panel's own size, so the layout, the hit testing
+  // and the input coordinates are all the ones the renderer already knows. The
+  // window is the size of the frame instead, which is what sets the resolution
+  // Chromium rasterises at: it comes back at frame x the desktop's scale
+  // factor, so the frame is always a reduction and the text stays sharp.
+  const applySurface = () => {
+    win.setContentSize(frameWidth(), frameHeight());
+    win.webContents.enableDeviceEmulation({ screenPosition: 'desktop', screenSize: { width: protocol.WIDTH, height: panelHeight }, deviceScaleFactor: 1, viewSize: { width: protocol.WIDTH, height: panelHeight }, viewPosition: { x: 0, y: 0 }, scale: 1 });
+  };
+  const preferenceChanged=(dir,value)=>{
+    if(dir!==userData||closed||win.isDestroyed())return;
+    // A size chosen in the app reaches the panel in the game as it is dragged,
+    // not at the next launch.
+    const wanted=protocol.scaleOf(value.uiScale);
+    if(wanted!==uiScale){uiScale=wanted;applySurface();}
+    win.webContents.send('lab-overlay-preferences',value);
+  };
   const control = (event, command) => {
     if (closed || !client || event.sender !== win.webContents) return;
     if (Date.now() - commandTime > 1000) { commandTime = Date.now(); commandCount = 0; }
@@ -33,11 +54,12 @@ module.exports = async function startOverlayBridge({ BrowserWindow, userData, id
     try { client.write(protocol.command(runtimeStatus, command)); } catch(error) { console.warn('Lab overlay command rejected:',error.message); }
   };
   ipcMain.on('lab-overlay-control', control);
+  // The renderer reports the panel's CSS height; the scale turns it into the
+  // frame's height.
   const resize = (event, height) => {
-    if (closed || event.sender !== win.webContents || !Number.isInteger(height) || height < 200 || height > protocol.MAX_HEIGHT) return;
+    if (closed || event.sender !== win.webContents || !Number.isInteger(height) || height < 200 || height > protocol.MAX_CSS_HEIGHT) return;
     panelHeight = height;
-    win.setContentSize(protocol.WIDTH, height);
-    win.webContents.enableDeviceEmulation({ screenPosition: 'desktop', screenSize: { width: protocol.WIDTH, height }, deviceScaleFactor: 1, viewSize: { width: protocol.WIDTH, height }, viewPosition: { x: 0, y: 0 }, scale: 1 });
+    applySurface();
     win.webContents.invalidate();
   };
   ipcMain.on('lab-overlay-resize', resize);
@@ -62,10 +84,10 @@ module.exports = async function startOverlayBridge({ BrowserWindow, userData, id
     if (!painted.width || !painted.height) return;
     // Resized to the panel's own height rather than by aspect ratio, so a
     // rounded scale cannot drift a row per frame.
-    const frame = painted.width === protocol.WIDTH ? image
-      : image.resize({ width: protocol.WIDTH, height: panelHeight, quality: 'good' });
+    const frame = painted.width === frameWidth() && painted.height === frameHeight() ? image
+      : image.resize({ width: frameWidth(), height: frameHeight(), quality: 'good' });
     const { width, height } = frame.getSize();
-    if (width !== protocol.WIDTH || height < 1 || height > protocol.MAX_HEIGHT) return;
+    if (width !== frameWidth() || height < 1 || height > protocol.MAX_HEIGHT) return;
     const bitmap = frame.toBitmap();
     // A bitmap that is not exactly the size it claims would be refused by the
     // add-on and drop the connection; skip the frame instead.
@@ -86,14 +108,14 @@ module.exports = async function startOverlayBridge({ BrowserWindow, userData, id
   win.on('closed', close);
   try {
   await win.loadFile(path.join(__dirname, 'renderer/overlay-panel.html'));
-  win.webContents.send('lab-overlay-preferences',preferences.read(userData));
+  const stored = preferences.read(userData);
+  uiScale = protocol.scaleOf(stored.uiScale);
+  win.webContents.send('lab-overlay-preferences', stored);
   preferences.events.on('change',preferenceChanged);
   const height = Math.ceil(await win.webContents.executeJavaScript(`document.querySelector('#panel').getBoundingClientRect().height`));
-  if (height < 1 || height > protocol.MAX_HEIGHT) { win.destroy(); throw Error('Overlay panel height exceeds its bounded surface'); }
+  if (height < 1 || height > protocol.MAX_CSS_HEIGHT) { win.destroy(); throw Error('Overlay panel height exceeds its bounded surface'); }
   panelHeight = height;
-  win.setContentSize(protocol.WIDTH, height);
-  // Fixed CSS pixels regardless of desktop DPI. No scaling/reflow in the native UI.
-  win.webContents.enableDeviceEmulation({ screenPosition: 'desktop', screenSize: { width: protocol.WIDTH, height }, deviceScaleFactor: 1, viewSize: { width: protocol.WIDTH, height }, viewPosition: { x: 0, y: 0 }, scale: 1 });
+  applySurface();
   ready = true;
   win.webContents.invalidate();
   server = net.createServer(socket => {
@@ -150,8 +172,12 @@ module.exports = async function startOverlayBridge({ BrowserWindow, userData, id
           if (e.action === 2) mouseDown = true;
           if (e.action === 3 || e.action === 6) mouseDown = false;
           if (e.action === 6) { win.webContents.sendInputEvent({ type: 'mouseUp', x: -1, y: -1, button: 'left', clickCount: 1 }); continue; }
-          if (e.action <= 3) win.webContents.sendInputEvent({ type: ['', 'mouseMove', 'mouseDown', 'mouseUp'][e.action], x: e.x, y: e.y, button: 'left', modifiers: mouseDown ? ['leftButtonDown'] : [], clickCount: e.action === 1 ? 0 : 1 });
-          if (e.action === 4) win.webContents.sendInputEvent({ type: 'mouseWheel', x: e.x, y: e.y, deltaY: e.value, deltaX: 0 });
+          // The add-on speaks frame pixels, because frame pixels are what it
+          // draws and hit-tests. The page is laid out in the panel's own 534,
+          // so a coordinate has to come back down before it can mean a control.
+          const css = v => Math.round(v / uiScale);
+          if (e.action <= 3) win.webContents.sendInputEvent({ type: ['', 'mouseMove', 'mouseDown', 'mouseUp'][e.action], x: css(e.x), y: css(e.y), button: 'left', modifiers: mouseDown ? ['leftButtonDown'] : [], clickCount: e.action === 1 ? 0 : 1 });
+          if (e.action === 4) win.webContents.sendInputEvent({ type: 'mouseWheel', x: css(e.x), y: css(e.y), deltaY: e.value, deltaX: 0 });
           if (e.action === 5) {
             const keyCode = ['Tab', 'Left', 'Right', 'Up', 'Down', 'Space', 'Return', 'Tab', 'Backspace', 'Delete', 'A', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '-'][e.value];
             const modifiers = e.value === 7 ? ['shift'] : e.value === 10 ? ['control'] : [];

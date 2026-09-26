@@ -3,7 +3,28 @@
 // Room for the Feeder to grow controls without a protocol change; a cap so a
 // malformed status cannot ask for unbounded work.
 const MAX_FEED_TOOLS = 24;
-const WIDTH = 534, MAX_HEIGHT = 1600;
+// The panel lays out at a fixed 534 points, and the UI scale decides how many
+// pixels that is rendered and streamed at. It used to be 534 pixels whatever
+// the screen, so a 4K display stretched one small bitmap to fit: the panel came
+// out both small and soft. The app now renders the panel larger instead, and
+// the add-on draws the frame it is handed one pixel to one panel pixel.
+const WIDTH = 534, MIN_SCALE = 0.75, MAX_SCALE = 2.5;
+// The frame bounds. Round numbers rather than Math.round(534 x 0.75), which is
+// 401: these are the bounds the add-on writes down too, and a pair that differs
+// by one is a connection that drops for no visible reason. Nothing sends
+// exactly MIN_WIDTH - the smallest size renders 401 - it is the floor.
+// test/overlay-panel-scale.test.js holds the two files together.
+const MIN_WIDTH = 400, MAX_WIDTH = 1335;
+// The layout's own bound, and the frame bound that follows from it. Both sides
+// use these to size their buffers, so they have to agree.
+const MAX_CSS_HEIGHT = 1600, MAX_HEIGHT = Math.round(MAX_CSS_HEIGHT * MAX_SCALE);
+// A settings file may hold anything. Anything that is not a drawable scale
+// reads as 1, so an old or hand-edited file cannot ask for a frame the add-on
+// will refuse - which would leave the panel blank with nothing said about why.
+function scaleOf(value) {
+  return Number.isFinite(value) && value >= MIN_SCALE && value <= MAX_SCALE ? value : 1;
+}
+const widthFor = scale => Math.round(WIDTH * scaleOf(scale));
 const FRAME_MAGIC = 0x31464c44, INPUT_MAGIC = 0x31494c44;
 const HELLO_VALUE = 0x4c414234, PREVIOUS_HELLO_VALUE = 0x4c414233, OLD_HELLO_VALUE = 0x4c414232, LEGACY_HELLO_VALUE = 0x4c414231;
 function helloReply(version = HELLO_VALUE) {
@@ -14,12 +35,21 @@ function helloReply(version = HELLO_VALUE) {
 // Fixed-size, little-endian protocol. It transports only UI pixels and input,
 // never executable code, paths, scripts or game data.
 function frame(bitmap, width, height, sequence) {
-  if (width !== WIDTH || !Number.isInteger(height) || height < 1 || height > MAX_HEIGHT || bitmap.length !== width * height * 4) throw Error('Invalid overlay frame');
+  if (!Number.isInteger(width) || width < MIN_WIDTH || width > MAX_WIDTH || !Number.isInteger(height) || height < 1 || height > MAX_HEIGHT || bitmap.length !== width * height * 4) throw Error('Invalid overlay frame');
   const result = Buffer.allocUnsafe(24 + bitmap.length);
   [FRAME_MAGIC, 1, sequence >>> 0, width, height, bitmap.length].forEach((n, i) => result.writeUInt32LE(n, i * 4));
-  // Chromium gives premultiplied BGRA; ReShade blends straight-alpha RGBA.
+  // Chromium gives premultiplied BGRA; ReShade blends straight-alpha RGBA. An
+  // opaque pixel needs no unscaling - scale is 255/255 - and at the sizes a
+  // scaled panel reaches, the panel's own body is most of them, so the
+  // arithmetic is skipped where it would only multiply by one.
   for (let i = 0; i < bitmap.length; i += 4) {
-    const a = bitmap[i + 3], scale = a ? 255 / a : 0;
+    const a = bitmap[i + 3];
+    if (a === 255) {
+      result[i + 24] = bitmap[i + 2]; result[i + 25] = bitmap[i + 1];
+      result[i + 26] = bitmap[i]; result[i + 27] = 255;
+      continue;
+    }
+    const scale = a ? 255 / a : 0;
     result[i + 24] = Math.min(255, Math.round(bitmap[i + 2] * scale));
     result[i + 25] = Math.min(255, Math.round(bitmap[i + 1] * scale));
     result[i + 26] = Math.min(255, Math.round(bitmap[i] * scale));
@@ -35,7 +65,7 @@ function input(packet) {
   if (action === 5 && (value < 0 || value > 22)) throw Error('Invalid key');
   return { action, x, y, value };
 }
-module.exports = { WIDTH, MAX_HEIGHT, FRAME_MAGIC, INPUT_MAGIC, HELLO_VALUE, PREVIOUS_HELLO_VALUE, OLD_HELLO_VALUE, LEGACY_HELLO_VALUE, helloReply, frame, input };
+module.exports = { WIDTH, MIN_SCALE, MAX_SCALE, MIN_WIDTH, MAX_WIDTH, MAX_CSS_HEIGHT, MAX_HEIGHT, scaleOf, widthFor, FRAME_MAGIC, INPUT_MAGIC, HELLO_VALUE, PREVIOUS_HELLO_VALUE, OLD_HELLO_VALUE, LEGACY_HELLO_VALUE, helloReply, frame, input };
 module.exports.status = value => {
   if (!value || !Number.isInteger(value.epoch) || value.epoch < 1 || value.epoch > 0xffffffff || typeof value.effects !== 'boolean' || !Array.isArray(value.tools) || value.tools.length > 100) throw Error('Invalid runtime status');
   const ids = new Set();
